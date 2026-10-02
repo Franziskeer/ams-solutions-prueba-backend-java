@@ -3,6 +3,7 @@ package com.amssolutions.similarproducts.product;
 import static com.github.tomakehurst.wiremock.client.WireMock.get;
 import static com.github.tomakehurst.wiremock.client.WireMock.notFound;
 import static com.github.tomakehurst.wiremock.client.WireMock.okJson;
+import static com.github.tomakehurst.wiremock.client.WireMock.serverError;
 import static com.github.tomakehurst.wiremock.client.WireMock.stubFor;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -78,5 +79,27 @@ class ProductClientTest {
                         .build());
 
         assertThatThrownBy(() -> timedOutClient.getProduct("1000")).isInstanceOf(ResourceAccessException.class);
+    }
+
+    @Test
+    void throwsUpstreamErrorWhenSimilarIdsReturns500() {
+        stubFor(get("/product/8/similarids").willReturn(serverError()));
+
+        assertThatThrownBy(() -> client.getSimilarIds("8"))
+                .isInstanceOf(ProductUpstreamException.class);
+    }
+
+    @Test
+    void thrownsUpstreamTimeoutWhenSimilarIdsTakesTooLong(WireMockRuntimeInfo wireMock) {
+        stubFor(get("/product/9/similarids").willReturn(okJson("[1]").withFixedDelay(1000)));
+
+        JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory();
+        requestFactory.setReadTimeout(Duration.ofMillis(200));
+        ProductClient timedOutClient = new ProductClient(RestClient.builder()
+                .baseUrl(wireMock.getHttpBaseUrl())
+                .requestFactory(requestFactory)
+                .build());
+
+        assertThatThrownBy(() -> timedOutClient.getSimilarIds("9")).isInstanceOf(ProductUpstreamTimeoutException.class);
     }
 }
