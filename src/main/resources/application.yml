@@ -7,3 +7,6 @@ spring:
 
 server:
   port: 5000
+
+mocks:
+  base-url: http://localhost:3001
