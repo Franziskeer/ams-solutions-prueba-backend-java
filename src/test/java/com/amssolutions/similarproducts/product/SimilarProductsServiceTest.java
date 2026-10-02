@@ -85,6 +85,16 @@ class SimilarProductsServiceTest {
                 .isInstanceOf(ProductNotFoundException.class);
     }
 
+    @Test
+    void omitsSimilarProductsThatFail() {
+        when(productClient.getSimilarIds("1")).thenReturn(List.of("2", "3", "4"));
+        when(productClient.getProduct("2")).thenReturn(DRESS);
+        when(productClient.getProduct("3")).thenThrow(new ProductNotFoundException("3"));
+        when(productClient.getProduct("4")).thenThrow(new IllegalStateException("Mocks error"));
+
+        assertThat(service.getSimilarProducts("1")).containsExactly(DRESS);
+    }
+
     private static Answer<ProductDetail> after(Duration delay, ProductDetail product) {
         return invocation -> {
             Thread.sleep(delay);
