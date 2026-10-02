@@ -5,8 +5,8 @@ Prueba técnica: API REST en Spring Boot que expone el detalle de los productos 
 ## Aplicación
 
 - La aplicación escucha en el puerto 5000.
-- Contrato a exponer: `similarProducts.yaml`. APIs existentes que se consumen: `existingApis.yaml`, servidas por los mocks en `http://localhost:3001`.
-- `shared/`, `docker-compose.yaml` y los YAML de contrato forman parte de la evaluación y no se modifican.
+- Contrato a exponer: `docs/similarProducts.yaml`. APIs existentes que se consumen: `docs/existingApis.yaml`, servidas por los mocks en `http://localhost:3001`.
+- `shared/` y `docker-compose.yaml` forman parte de la evaluación y no se modifican. El contenido de los YAML de contrato tampoco.
 
 ## Git
 
