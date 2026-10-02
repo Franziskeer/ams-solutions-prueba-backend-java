@@ -10,7 +10,7 @@ Elegí Java 25 porque es la versión LTS actual y la aplicación usa virtual thr
 
 ## Cómo ejecutarlo
 
-Es necesario tener instalado Docker para los mocks y la infraestructura de evaluación, y un JDK 25 para la aplicación.
+Hace falta Docker para los mocks, la infraestructura de evaluación y, si no hay JDK, también para la aplicación. Con un JDK 25 se puede arrancar sin construir la imagen.
 
 Levantar los mocks y la infraestructura de evaluación:
 
@@ -18,13 +18,22 @@ Levantar los mocks y la infraestructura de evaluación:
 docker-compose up -d simulado influxdb grafana
 ```
 
-Levantar la aplicación, que escucha en el puerto 5000:
+Levantar la aplicación, que escucha en el puerto 5000. Para desarrollar, con el JDK:
 
 ```bash
 ./mvnw spring-boot:run
 ```
 
-Ejecutar el test de carga:
+Para evaluar, solo con Docker. La imagen se construye dentro del contenedor, así que en ese equipo no hace falta instalar Java ni Maven:
+
+```bash
+docker build -t similar-products .
+docker run --rm -p 5000:5000 --add-host=host.docker.internal:host-gateway similar-products
+```
+
+k6 llama a `http://host.docker.internal:5000`, fijo en `shared/k6/test.js`, y ese fichero no se puede cambiar. Publicar el puerto 5000 deja la aplicación en esa URL. No la he metido en `docker-compose.yaml`: dentro de esa red k6 dejaría de alcanzarla en `host.docker.internal` y habría que tocar sus URLs. Desde el contenedor, `localhost:3001` no son los mocks del PC, así que la imagen usa `host.docker.internal:3001`.
+
+Ejecutar el test de carga en otro terminal:
 
 ```bash
 docker-compose run --rm k6 run scripts/test.js
@@ -45,7 +54,7 @@ No necesitan los mocks levantados. Cada pieza se prueba aislando la que tiene po
 - `ProductClientTest` prueba el cliente contra un servidor HTTP real que levanta WireMock en un puerto libre, con las mismas respuestas que `shared/simulado/mocks.json`, incluidos 404, 500 y retrasos para los timeouts. También comprueba que un producto lento acaba guardado y la siguiente llamada es rápida.
 - `SimilarProductsServiceTest` prueba el servicio sustituyendo el cliente por un mock de Mockito, que puede tardar lo que se le indique en responder. Así se comprueba el orden, el paralelismo y que un detalle que falla se omite.
 - `SimilarProductsControllerTest` prueba solo la capa web con `@WebMvcTest` y `MockMvc`: la ruta, el JSON de la respuesta y los códigos 200, 404, 502 y 504.
-- `SimilarProductsApplicationTests` arranca la aplicación entera y falla si algún bean no se puede crear.
+- `SimilarProductsApplicationTests` arranca la aplicación entera, comprueba que `/actuator/health` responde `UP` y falla si algún bean no se puede crear.
 
 ### Integración continua
 
@@ -70,22 +79,9 @@ La lógica funcional es casi trivial. Consiste en pedir los ids similares, pedir
 
 ### Visión general
 
-```mermaid
-sequenceDiagram
-    participant Client as Cliente
-    participant App as API_5000
-    participant Mocks as Mocks_3001
-    Client->>App: GET /product/1/similar
-    App->>Mocks: GET /product/1/similarids
-    Mocks-->>App: "[2,3,4]"
-    par en paralelo
-        App->>Mocks: GET /product/2
-        App->>Mocks: GET /product/3
-        App->>Mocks: GET /product/4
-    end
-    Mocks-->>App: detalles
-    App-->>Client: "200 con los detalles en orden de similitud"
-```
+![Secuencia de una petición de productos similares: el cliente llama a la API, la API pide los ids y los detalles en paralelo a los mocks, y responde 200 en orden de similitud.](docs/diagrams/similar-products-sequence.png)
+
+La versión explorable está en [docs/diagrams/similar-products-sequence.html](docs/diagrams/similar-products-sequence.html).
 
 Si el producto principal no existe, los mocks responden 404 a `similarids` y la API devuelve 404. Si un producto similar falla o tarda demasiado, se omite y la API responde 200 con el resto.
 
@@ -143,7 +139,7 @@ Para hacer las peticiones uso el cliente HTTP que ya trae Java, en lugar de aña
 
 Los mocks devuelven los ids como números (`[2,3,4]`), aunque el contrato los define como texto. En lugar de fallar, el cliente los acepta y los convierte a texto. Es ser tolerante con lo que se recibe de otro sistema mientras se cumple estrictamente el contrato propio. Hay un test que lo comprueba con la misma respuesta que dan los mocks.
 
-La URL y los timeouts de los mocks no están escritos en el código. Se leen de `application.yml` (`mocks.base-url`, por defecto `http://localhost:3001`, el servidor que declara `docs/existingApis.yaml`), porque cambian entre entornos y no tiene sentido recompilar para ajustarlos.
+La URL y los timeouts de los mocks no están escritos en el código. Se leen de `application.yml` (`mocks.base-url`, por defecto `http://localhost:3001`, el servidor que declara `docs/contracts/existingApis.yaml`), porque cambian entre entornos y no tiene sentido recompilar para ajustarlos.
 
 ### Modelo de datos
 
@@ -195,6 +191,38 @@ El contrato solo define 200 y 404. Los otros códigos son decisión mía, para d
 - **504 GATEWAY_TIMEOUT** si `similarids` no responde a tiempo.
 
 El cuerpo es `ProblemDetail` (RFC 9457), el formato estándar de errores HTTP. Spring lo trae de serie: `status`, `title` y `detail`. El 404 también lo usa. El contrato no pide cuerpo en el 404, pero un JSON extra no rompe a quien solo mira el código.
+
+### Observabilidad
+
+Cuando un producto similar se omite, el servicio deja un `WARN` en el log con el id y el motivo. Con eso se ve qué se cayó de la respuesta.
+
+Además he expuesto Actuator solo en `/actuator/health`. Dice si el proceso está vivo, que es lo que miraría un balanceador. No he abierto el resto de endpoints: beans, env o métricas no aportan nada en esta prueba y enseñan más de la cuenta. El cuerpo es solo el estado, `{"status":"UP"}`.
+
+### Resultados del test de carga
+
+Pasé k6 contra la aplicación en Docker, con 200 usuarios durante 10 segundos en cada escenario. Todas las respuestas fueron 200.
+
+| Escenario  | Peticiones | Media  | p95    |
+| ---------- | ---------- | ------ | ------ |
+| `normal`   | 3933       | 15 ms  | 30 ms  |
+| `notFound` | 3722       | 44 ms  | 156 ms |
+| `error`    | 3816       | 28 ms  | 66 ms  |
+| `slow`     | 2398       | 351 ms | 2,1 s  |
+| `verySlow` | 799        | 2,0 s  | 2,1 s  |
+
+En conjunto fueron 14679 peticiones. La media quedó en 190 ms y ninguna pasó de 2,1 s.
+
+![Resultados de k6 en Grafana, de 18:08 a 18:11. Las peticiones son todas 200. La duración sube a 2 s en slow y se queda ahí en verySlow.](docs/load-test/k6-grafana.png)
+
+En la captura, `normal`, `notFound` y `error` van a ras de suelo. En `slow` se ve el pico de las primeras peticiones, que esperan a Coat, y luego baja. `verySlow` se queda en los 2 s: el producto de 50 s no cabe en los 10 s del escenario, así que no llega a guardarse.
+
+### Limitaciones
+
+La caché vive en la memoria de este proceso. Al reiniciar se vacía, y si hubiera varias instancias cada una tendría la suya.
+
+No guardo los errores. El producto 6 siempre da 500, y guardarlo sería seguir devolviendo un fallo que ya no existe.
+
+Caffeine escribe un aviso con traza cuando una carga falla. No cambia la respuesta. Es ruido en el log.
 
 ## Referencia
 
