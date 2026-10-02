@@ -18,7 +18,7 @@ class ProductConfig {
                 .connectTimeout(properties.connectTimeout())
                 .build();
         JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory(httpClient);
-        requestFactory.setReadTimeout(properties.readTimeout());
+        requestFactory.setReadTimeout(properties.httpReadTimeout());
         return builder
                 .baseUrl(properties.baseUrl())
                 .requestFactory(requestFactory)
