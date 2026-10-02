@@ -42,9 +42,9 @@ Los tests se lanzan con:
 
 No necesitan los mocks levantados. Cada pieza se prueba aislando la que tiene por debajo:
 
-- `ProductClientTest` prueba el cliente contra un servidor HTTP real que levanta WireMock en un puerto libre, con las mismas respuestas que `shared/simulado/mocks.json`.
-- `SimilarProductsServiceTest` prueba el servicio sustituyendo el cliente por un mock de Mockito, que puede tardar lo que se le indique en responder. Así se comprueba el orden y el paralelismo sin depender de la red.
-- `SimilarProductsControllerTest` prueba solo la capa web con `@WebMvcTest` y `MockMvc`: la ruta, el JSON de la respuesta y los códigos HTTP.
+- `ProductClientTest` prueba el cliente contra un servidor HTTP real que levanta WireMock en un puerto libre, con las mismas respuestas que `shared/simulado/mocks.json`, incluidos 404, 500 y retrasos para los timeouts.
+- `SimilarProductsServiceTest` prueba el servicio sustituyendo el cliente por un mock de Mockito, que puede tardar lo que se le indique en responder. Así se comprueba el orden, el paralelismo y que un detalle que falla se omite.
+- `SimilarProductsControllerTest` prueba solo la capa web con `@WebMvcTest` y `MockMvc`: la ruta, el JSON de la respuesta y los códigos 200, 404, 502 y 504.
 - `SimilarProductsApplicationTests` arranca la aplicación entera y falla si algún bean no se puede crear.
 
 ### Integración continua
@@ -87,7 +87,7 @@ sequenceDiagram
     App-->>Client: "200 con los detalles en orden de similitud"
 ```
 
-Si el producto principal no existe, los mocks responden 404 a `similarids` y la API devuelve 404.
+Si el producto principal no existe, los mocks responden 404 a `similarids` y la API devuelve 404. Si un producto similar falla o tarda demasiado, se omite y la API responde 200 con el resto.
 
 ### Estructura de carpetas
 
@@ -100,14 +100,16 @@ src/main/java/com/amssolutions/similarproducts/
     ProductClient.java                 # cliente de las APIs existentes de los mocks
     ProductExceptionHandler.java       # traduce las excepciones del dominio a códigos HTTP
     ProductNotFoundException.java      # el producto no existe en los mocks
+    ProductUpstreamException.java      # los mocks respondieron mal (502)
+    ProductUpstreamTimeoutException.java  # los mocks no respondieron a tiempo (504)
     ProductDetail.java                 # detalle de producto, tal como lo define el contrato
     ProductConfig.java                 # beans: RestClient hacia los mocks y executor de virtual threads
-    MocksProperties.java               # URL de los mocks leída de application.yml
+    MocksProperties.java               # URL y timeouts de los mocks, leídos de application.yml
 ```
 
 He agrupado el código por dominio y no por capas técnicas, el mismo criterio que seguí en la prueba de Python. Todo lo relacionado con los productos vive junto en `product/`, de modo que para entender o cambiar la funcionalidad no hay que saltar entre carpetas.
 
-Dentro del paquete sí he separado responsabilidades. El controller solo habla HTTP, el servicio decide qué pedir y en qué orden, y el cliente solo sabe hablar con los mocks.
+Dentro del paquete sí he separado responsabilidades. El controller solo habla HTTP, el servicio decide qué pedir y en qué orden, y el cliente solo sabe hablar con los mocks. No he creado un subpaquete `exceptions/` ni capas dentro del paquete ya que con un solo caso de uso sería mover ficheros sin ganar claridad. Si el dominio creciera, el siguiente corte podría ser extraer un puerto (una interfaz del cliente) y dejar la implementación HTTP como adaptador.
 
 ### Modelo de concurrencia
 
@@ -135,21 +137,54 @@ El executor que crea los virtual threads lo crea Spring una sola vez al arrancar
 
 `ProductClient` es un adaptador, la misma idea que el cliente del proveedor en la prueba de Python. Es la única pieza que sabe que los productos vienen de una API HTTP externa. El resto de la aplicación le pide "los ids similares" o "el detalle de un producto" sin saber de dónde salen. Si mañana esos datos vinieran de otro servicio o de una base de datos, solo cambiaría esta clase.
 
-Por la misma razón, el cliente no deja escapar los errores HTTP tal cual. Cuando los mocks responden 404, lo traduce a `ProductNotFoundException`, una excepción del dominio que dice qué ha pasado ("ese producto no existe") y no cómo se ha enterado. Además, el cliente no decide qué hacer con ese error, porque depende del contexto. Si no existe el producto principal, la API debe responder 404 y si no existe un producto similar, basta con omitirlo. Esa decisión es del servicio, que es quien conoce el contexto.
+Por la misma razón, el cliente no deja escapar los errores HTTP tal cual. Los traduce a excepciones del dominio: `ProductNotFoundException` si el producto no existe, `ProductUpstreamException` si los mocks responden mal y `ProductUpstreamTimeoutException` si no responden a tiempo. El resto de la aplicación ve qué ha pasado, no el código HTTP. Qué hacer con ese error depende del contexto, y eso lo decide el servicio: si falla el producto principal, la API responde 404, 502 o 504; si falla un producto similar, se omite.
 
 Para hacer las peticiones uso el cliente HTTP que ya trae Java, en lugar de añadir una librería. Prefiero no sumar dependencias si la plataforma ya ofrece lo necesario, y lo he dejado indicado de forma explícita en `ProductConfig` para que se vea qué se usa sin tener que deducirlo.
 
 Los mocks devuelven los ids como números (`[2,3,4]`), aunque el contrato los define como texto. En lugar de fallar, el cliente los acepta y los convierte a texto. Es ser tolerante con lo que se recibe de otro sistema mientras se cumple estrictamente el contrato propio. Hay un test que lo comprueba con la misma respuesta que dan los mocks.
 
-La URL de los mocks no está escrita en el código. Se lee de `application.yml` (`mocks.base-url`, por defecto `http://localhost:3001`, el servidor que declara `docs/existingApis.yaml`), porque cambia entre entornos y no tiene sentido recompilar para apuntar a otro sitio.
+La URL y los timeouts de los mocks no están escritos en el código. Se leen de `application.yml` (`mocks.base-url`, por defecto `http://localhost:3001`, el servidor que declara `docs/existingApis.yaml`), porque cambian entre entornos y no tiene sentido recompilar para ajustarlos.
 
 ### Modelo de datos
 
 `ProductDetail` es un `record` con los cuatro campos del contrato. Uso `BigDecimal` para el precio porque al tratarse de dinero, si usáramos `double` se guardarían los decimales de forma aproximada (0.1 + 0.2 = 0.30000000000000004). Para `availability` uso `boolean`, porque el contrato lo marca como obligatorio.
 
+### Fallos parciales
+
+La primera versión del endpoint fallaba entera si fallaba un solo similar. El producto 4 devolvía 404 porque uno de sus similares no existe, y el 5 devolvía 500 porque otro da error interno. k6 lo comprueba a propósito en los escenarios `notFound` y `error`.
+
+Me pareció peor dejar al cliente sin ningún producto que devolverle una lista incompleta. Un similar que no se puede cargar no debería tumbar la página del que sí existe. Por eso el servicio pide cada detalle dentro de un `try/catch`: si falla, lo anota en el log y lo deja fuera. La respuesta sigue siendo 200, en el orden de similitud, con los que sí respondieron. Si fallan todos, la lista vacía `[]` es válida según el contrato.
+
+El 404 del producto principal sigue siendo 404. Ese fallo no es parcial: no hay similares que mostrar si ni siquiera sabemos cuáles son.
+
+No reintento los detalles que fallan. En los mocks los errores son fijos: el producto 6 siempre da 500. Reintentar sería repetir un fallo seguro y alargar la respuesta.
+
+### Timeouts
+
+Sin un tiempo máximo, una llamada al producto 10000 deja la petición 50 segundos esperando, y con 200 usuarios así k6 apenas obtiene respuestas. Medí esa línea base antes de poner el timeout ya que el escenario `verySlow` se quedó en 15 peticiones, la mayoría 500, porque al abrir tantas conexiones a la vez algunas fallaban.
+
+Hay dos configuraciones de timeout, los dos en `application.yml`:
+
+| Propiedad               | Valor por defecto | Por qué ese valor                                                                                          |
+| ----------------------- | ----------------- | ---------------------------------------------------------------------------------------------------------- |
+| `mocks.connect-timeout` | `500ms`           | Si los mocks no aceptan la conexión, se nota enseguida. No hace falta esperar más.                         |
+| `mocks.read-timeout`    | `2s`              | Entra el producto 100 (1 s) y se omiten el 1000 (5 s) y el 10000 (50 s). La respuesta no pasa de unos 2 s. |
+
+Elegí 2 s después de ver los retrasos de los mocks. 500 ms habría sido más rápido, pero también habría perdido el producto de 1 s. 6 segundos habría incluido el de 5 s, demasiado para una pantalla de producto. El coste que acepto es devolver menos productos a cambio de una latencia acotada. En el siguiente hito implementaré una caché para recuperar los lentos sin hacer esperar a nadie.
+
+Tras este cambio, k6 pasó de 404 y 500 en `notFound` y `error` a 200, y `slow` y `verySlow` bajaron de unos 6 segundos (o a colapsar) a unos 2,2 segundos. En `verySlow` hubo 4 respuestas 504 entre más de 800.
+
 ### Errores y códigos HTTP
 
-El servicio no sabe nada de HTTP. Cuando el producto principal no existe, la excepción del dominio sube hasta `ProductExceptionHandler`, un `@RestControllerAdvice` que la traduce a 404 en un único sitio. Así el controller se limita a llamar al servicio, y los códigos de error que lleguen más adelante tendrán su sitio sin tocar el endpoint.
+El servicio no sabe nada de HTTP. Lanza excepciones del dominio y `ProductExceptionHandler` (`@RestControllerAdvice`) las traduce en un único sitio. El controller se limita a llamar al servicio.
+
+El contrato solo define 200 y 404. Los otros códigos son decisión mía, para distinguir un producto que no existe de un fallo detrás de la API:
+
+- **404 NOT_FOUND** si el producto principal no existe.
+- **502 BAD_GATEWAY** si `similarids` responde mal. El frontend hizo bien la petición; ha fallado el servicio del que dependo.
+- **504 GATEWAY_TIMEOUT** si `similarids` no responde a tiempo.
+
+El cuerpo es `ProblemDetail` (RFC 9457), el formato estándar de errores HTTP. Spring lo trae de serie: `status`, `title` y `detail`. El 404 también lo usa. El contrato no pide cuerpo en el 404, pero un JSON extra no rompe a quien solo mira el código.
 
 ## Referencia
 
