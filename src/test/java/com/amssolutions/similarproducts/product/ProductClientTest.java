@@ -6,11 +6,16 @@ import static com.github.tomakehurst.wiremock.client.WireMock.okJson;
 import static com.github.tomakehurst.wiremock.client.WireMock.stubFor;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
 import java.math.BigDecimal;
+import java.time.Duration;
+
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
+import org.springframework.web.client.ResourceAccessException;
 import org.springframework.web.client.RestClient;
+
 import com.github.tomakehurst.wiremock.junit5.WireMockRuntimeInfo;
 import com.github.tomakehurst.wiremock.junit5.WireMockTest;
 
@@ -55,5 +60,23 @@ class ProductClientTest {
         stubFor(get("/product/5").willReturn(notFound()));
         assertThatThrownBy(() -> client.getProduct("5"))
                 .isInstanceOf(ProductNotFoundException.class);
+    }
+
+    @Test
+    void throwsWhenProductTakesLongerThanReadTimeout(WireMockRuntimeInfo wireMock) {
+        stubFor(get("/product/1000").willReturn(okJson("""
+                {"id":"1000","name":"Coat","price":89.99,"availability":true}
+                """)
+                .withFixedDelay(1000)));
+
+        JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory();
+        requestFactory.setReadTimeout(Duration.ofMillis(200));
+        ProductClient timedOutClient = new ProductClient(
+                RestClient.builder()
+                        .baseUrl(wireMock.getHttpBaseUrl())
+                        .requestFactory(requestFactory)
+                        .build());
+
+        assertThatThrownBy(() -> timedOutClient.getProduct("1000")).isInstanceOf(ResourceAccessException.class);
     }
 }
