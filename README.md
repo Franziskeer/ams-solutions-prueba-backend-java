@@ -42,7 +42,7 @@ Los tests se lanzan con:
 
 No necesitan los mocks levantados. Cada pieza se prueba aislando la que tiene por debajo:
 
-- `ProductClientTest` prueba el cliente contra un servidor HTTP real que levanta WireMock en un puerto libre, con las mismas respuestas que `shared/simulado/mocks.json`, incluidos 404, 500 y retrasos para los timeouts.
+- `ProductClientTest` prueba el cliente contra un servidor HTTP real que levanta WireMock en un puerto libre, con las mismas respuestas que `shared/simulado/mocks.json`, incluidos 404, 500 y retrasos para los timeouts. También comprueba que un producto lento acaba guardado y la siguiente llamada es rápida.
 - `SimilarProductsServiceTest` prueba el servicio sustituyendo el cliente por un mock de Mockito, que puede tardar lo que se le indique en responder. Así se comprueba el orden, el paralelismo y que un detalle que falla se omite.
 - `SimilarProductsControllerTest` prueba solo la capa web con `@WebMvcTest` y `MockMvc`: la ruta, el JSON de la respuesta y los códigos 200, 404, 502 y 504.
 - `SimilarProductsApplicationTests` arranca la aplicación entera y falla si algún bean no se puede crear.
@@ -104,7 +104,7 @@ src/main/java/com/amssolutions/similarproducts/
     ProductUpstreamTimeoutException.java  # los mocks no respondieron a tiempo (504)
     ProductDetail.java                 # detalle de producto, tal como lo define el contrato
     ProductConfig.java                 # beans: RestClient hacia los mocks y executor de virtual threads
-    MocksProperties.java               # URL y timeouts de los mocks, leídos de application.yml
+    MocksProperties.java               # URL, timeouts y caché de los mocks, leídos de application.yml
 ```
 
 He agrupado el código por dominio y no por capas técnicas, el mismo criterio que seguí en la prueba de Python. Todo lo relacionado con los productos vive junto en `product/`, de modo que para entender o cambiar la funcionalidad no hay que saltar entre carpetas.
@@ -161,18 +161,28 @@ No reintento los detalles que fallan. En los mocks los errores son fijos: el pro
 
 ### Timeouts
 
-Sin un tiempo máximo, una llamada al producto 10000 deja la petición 50 segundos esperando, y con 200 usuarios así k6 apenas obtiene respuestas. Medí esa línea base antes de poner el timeout ya que el escenario `verySlow` se quedó en 15 peticiones, la mayoría 500, porque al abrir tantas conexiones a la vez algunas fallaban.
+Sin un tiempo máximo, una llamada al producto 10000 deja la petición 50 segundos esperando, y con 200 usuarios así k6 apenas obtiene respuestas. Medí esa línea base antes de poner el timeout ya que el escenario `verySlow` se quedó en 15 peticiones antes de implementarlo, la mayoría errores 500 porque al abrir tantas conexiones a la vez algunas fallaban.
 
-Hay dos configuraciones de timeout, los dos en `application.yml`:
+| Propiedad                 | Valor por defecto | Por qué ese valor                                                                                                                                        |
+| ------------------------- | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mocks.connect-timeout`   | `500ms`           | Si los mocks no aceptan la conexión, se nota enseguida. No hace falta esperar más.                                                                       |
+| `mocks.read-timeout`      | `2s`              | Cuánto espera la API antes de responder. Entra el producto de 1 s y se omiten el de 5 s y el de 50 s.                                                    |
+| `mocks.http-read-timeout` | `60s`             | Cuánto puede durar la llamada a los mocks. Más que los 2 s de espera, para que un producto lento pueda terminar y guardarse. Tiene que superar los 50 s. |
 
-| Propiedad               | Valor por defecto | Por qué ese valor                                                                                          |
-| ----------------------- | ----------------- | ---------------------------------------------------------------------------------------------------------- |
-| `mocks.connect-timeout` | `500ms`           | Si los mocks no aceptan la conexión, se nota enseguida. No hace falta esperar más.                         |
-| `mocks.read-timeout`    | `2s`              | Entra el producto 100 (1 s) y se omiten el 1000 (5 s) y el 10000 (50 s). La respuesta no pasa de unos 2 s. |
+Los valores elegidos se basan en las pruebas realizadas. Elegí 2 s después de ver los retrasos de los mocks. Haber elegido 500 ms habría sido más rápido, pero también habría perdido el producto que tarda 1 s. 6 segundos habría incluido el de 5 s, pero era demasiada espera para una supuesta pantalla de producto. El coste que acepto es devolver menos productos a cambio de una latencia acotada.
 
-Elegí 2 s después de ver los retrasos de los mocks. 500 ms habría sido más rápido, pero también habría perdido el producto de 1 s. 6 segundos habría incluido el de 5 s, demasiado para una pantalla de producto. El coste que acepto es devolver menos productos a cambio de una latencia acotada. En el siguiente hito implementaré una caché para recuperar los lentos sin hacer esperar a nadie.
+Tras este cambio, k6 pasó de errores 404 y 500 en las pruebas de `notFound` y `error` a estado 200; y `slow` y `verySlow` bajaron de unos 6 s (o a colapsar) a unos 2,2 segundos. En `verySlow` hubo 4 respuestas de error 504 entre más de 800.
 
-Tras este cambio, k6 pasó de 404 y 500 en `notFound` y `error` a 200, y `slow` y `verySlow` bajaron de unos 6 segundos (o a colapsar) a unos 2,2 segundos. En `verySlow` hubo 4 respuestas 504 entre más de 800.
+### Caché
+
+He añadido Caffeine, una caché en memoria para los productos. Guarda el detalle de cada producto y la lista de ids similares. Si el mismo producto se pide otra vez mientras la primera llamada sigue en curso, no se vuelve a llamar a los mocks: las demás esperan esa llamada y, cuando termina, leen el valor guardado. En una tienda real la misma ficha se consulta muchas veces y los similares no cambian a cada segundo, así que no tiene sentido volver a pedirlos en cada visita. De esta forma se mejora el rendimiento, porque la siguiente visita no espera, y la resiliencia, porque muchas visitas a la vez comparten una sola llamada. Los productos que el timeout deja fuera entran en la siguiente respuesta: a los 2 segundos la API responde sin ellos, pero la llamada a los mocks no se corta y, si llegan, se guardan.
+
+| Propiedad              | Valor por defecto | Por qué ese valor                                                                                                                 |
+| ---------------------- | ----------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `mocks.cache-ttl`      | `1m`              | Cuánto tiempo se recuerda un producto. En los mocks no cambia nada, pero en un catálogo el precio sí. Un minuto es un compromiso. |
+| `mocks.cache-max-size` | `1000`            | Tope de entradas para que la memoria no crezca sin límite. De sobra para los productos de esta prueba.                            |
+
+Sin caché, en la prueba de k6 cada petición volvía a llamar a los mocks aunque la respuesta no hubiera cambiado. Con el tope de 2 s eso se notaba en los lentos. El producto 2 tiene tres similares: uno de 100 ms, uno de 1 s y **Coat**, que tarda 5 s. Lo pedí con la aplicación recién arrancada. La primera respuesta tardó 2,3 segundos y vino sin **Coat** (sólo **Blazer** y **Trousers**) porque esta tardaba más que el timeout configurado. La repetí unos segundos después y tardó 4 milisegundos, esta vez incluyendo el **Coat**.
 
 ### Errores y códigos HTTP
 
