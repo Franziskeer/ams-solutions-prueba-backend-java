@@ -46,6 +46,27 @@ class SimilarProductsControllerTest {
         when(similarProductsService.getSimilarProducts("99")).thenThrow(new ProductNotFoundException("99"));
 
         mockMvc.perform(get("/product/99/similar"))
-                .andExpect(status().isNotFound());
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.status").value(404))
+                .andExpect(jsonPath("$.detail").value("Product not found: 99"));
+    }
+
+    @Test
+    void returns502WhenSimilarIdsFails() throws Exception {
+        when(similarProductsService.getSimilarProducts("1")).thenThrow(new ProductUpstreamException("1"));
+
+        mockMvc.perform(get("/product/1/similar"))
+                .andExpect(status().isBadGateway())
+                .andExpect(jsonPath("$.status").value(502));
+    }
+
+    @Test
+    void returns504WhenSimilarIdsTimesOut() throws Exception {
+        when(similarProductsService.getSimilarProducts("1"))
+                .thenThrow(new ProductUpstreamTimeoutException("1", new RuntimeException("timeout")));
+
+        mockMvc.perform(get("/product/1/similar"))
+                .andExpect(status().isGatewayTimeout())
+                .andExpect(jsonPath("$.status").value(504));
     }
 }
