@@ -12,3 +12,6 @@ mocks:
   base-url: http://localhost:3001
   connect-timeout: 500ms
   read-timeout: 2s
+  http-read-timeout: 60s
+  cache-ttl: 1m
+  cache-max-size: 1000
